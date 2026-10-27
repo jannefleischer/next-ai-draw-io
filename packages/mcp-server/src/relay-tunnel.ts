@@ -11,6 +11,7 @@
  * tunnel's polls carry the secret the relay hands out with it.
  */
 
+import { readFile } from "node:fs/promises"
 import http from "node:http"
 import { log } from "./logger.ts"
 
@@ -43,12 +44,20 @@ interface TunnelRequest {
     body?: string // base64
 }
 
+/**
+ * RELAY_TOKEN, or RELAY_TOKEN_FILE: a file read again on every connect, so
+ * whoever writes it (the HTTP gateway) can keep a short-lived token fresh
+ */
 export function relayConfigFromEnv(
     env: NodeJS.ProcessEnv = process.env,
-): { url: string; token: string } | null {
+): { url: string; token: string | (() => Promise<string>) } | null {
     const url = (env.RELAY_URL ?? "").replace(/\/+$/, "")
+    const file = env.RELAY_TOKEN_FILE ?? ""
     const token = env.RELAY_TOKEN ?? ""
     if (!url) return null
+    if (file) {
+        return { url, token: async () => (await readFile(file, "utf8")).trim() }
+    }
     if (!token) {
         log.warn("RELAY_URL is set without RELAY_TOKEN; the relay stays off")
         return null
