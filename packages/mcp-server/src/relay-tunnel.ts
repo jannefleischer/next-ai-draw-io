@@ -5,7 +5,10 @@
  * requests, replays each against 127.0.0.1 and posts the answer back. The
  * state stays here; the relay only forwards, and only for the token's owner.
  *
- * Set RELAY_URL (e.g. https://drawio.example.org) and RELAY_TOKEN.
+ * Set RELAY_URL (e.g. https://drawio.example.org) and RELAY_TOKEN: an OIDC
+ * access token the relay accepts (sent as Bearer) or a personal relay token
+ * from its token page (dmr_…). The token is needed to connect only; the
+ * tunnel's polls carry the secret the relay hands out with it.
  */
 
 import http from "node:http"
@@ -53,20 +56,35 @@ export function relayConfigFromEnv(
     return { url, token }
 }
 
+/** The headers that authenticate a connect with this token */
+export function relayAuthHeaders(token: string): Record<string, string> {
+    return token.startsWith("dmr_")
+        ? { "X-Relay-Token": token }
+        : { Authorization: `Bearer ${token}` }
+}
+
+/**
+ * token: the credential for the next connect; a function is asked again
+ * on every reconnect (an access token expires)
+ */
 export async function startRelayTunnel(
     relayUrl: string,
-    token: string,
+    token: string | (() => Promise<string>),
     localPort: number,
 ): Promise<RelayTunnel> {
-    const headers = { "X-Relay-Token": token }
+    let headers: Record<string, string> = {}
     let tunnelId = ""
     let prefix = ""
     let stopped = false
 
     const connect = async () => {
+        const credential = typeof token === "string" ? token : await token()
         const res = await fetch(`${relayUrl}/mcp-api/connect`, {
             method: "POST",
-            headers: { ...headers, "Content-Type": "application/json" },
+            headers: {
+                ...relayAuthHeaders(credential),
+                "Content-Type": "application/json",
+            },
             // Asking for the old id keeps open tabs working after a relay
             // restart or a network break
             body: JSON.stringify({ resume: tunnelId || undefined }),
@@ -76,12 +94,17 @@ export async function startRelayTunnel(
                 `Relay refused the connection: ${res.status} ${await res.text()}`,
             )
         }
-        const data = (await res.json()) as { tunnel: string; prefix: string }
+        const data = (await res.json()) as {
+            tunnel: string
+            secret: string
+            prefix: string
+        }
         if (prefix && data.prefix !== prefix) {
             log.warn(`Relay gave a new address; reopen the preview at ${relayUrl}${data.prefix}/shell/`)
         }
         tunnelId = data.tunnel
         prefix = data.prefix
+        headers = { "X-Tunnel-Secret": data.secret }
     }
 
     await connect()

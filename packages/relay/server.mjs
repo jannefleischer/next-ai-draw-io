@@ -5,16 +5,25 @@
 //   /mcp/t/<tunnel>/...    a preview tab's requests, forwarded to the MCP
 //                          process that owns the tunnel (proxy auth, owner only)
 //   /mcp-api/...           the MCP process: connect, long-poll, reply
-//                          (proxy lets it through; X-Relay-Token here)
+//                          (proxy lets it through; the relay checks itself)
+//
+// The MCP process connects with an OIDC access token (Authorization: Bearer,
+// audience OIDC_AUDIENCE, from one of OIDC_ISSUERS, signed with a key of
+// OIDC_JWKS_URL) or, for accounts without OIDC, a personal relay token from
+// the token page (X-Relay-Token). The token is checked on connect only: the
+// tunnel then gets a secret of its own for its polls, so it outlives the
+// short-lived access token while the tab stays open.
 //
 // The relay keeps no diagrams: the MCP process keeps its state and answers
 // the tab's requests through the tunnel (packages/mcp-server/src/relay-tunnel.ts).
 //
 // Env: PORT (8080), DATA_DIR (/data), PUBLIC_URL (for the Origin check of
 // the token page), USER_HEADERS (x-forwarded-email,x-forwarded-user: the
-// first one present names the user; local accounts of the proxy have no email).
+// first one present names the user; local accounts of the proxy have no email),
+// OIDC_ISSUERS (comma-separated), OIDC_AUDIENCE (drawio), OIDC_JWKS_URL,
+// OIDC_USER_CLAIM (email: must match what the proxy sends as the user).
 
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
+import { createHash, createPublicKey, randomBytes, timingSafeEqual, verify } from "node:crypto"
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import http from "node:http"
 import { join } from "node:path"
@@ -33,6 +42,10 @@ const REPLY_WAIT_MS = 60_000
 const TUNNEL_IDLE_MS = 10 * 60_000
 const MAX_TOKENS_PER_USER = 20
 const MAX_TUNNELS_PER_USER = 10
+const OIDC_ISSUERS = (process.env.OIDC_ISSUERS || "").split(",").map((s) => s.trim().replace(/\/+$/, "")).filter(Boolean)
+const OIDC_AUDIENCE = process.env.OIDC_AUDIENCE || "drawio"
+const OIDC_JWKS_URL = process.env.OIDC_JWKS_URL || ""
+const OIDC_USER_CLAIM = process.env.OIDC_USER_CLAIM || "email"
 
 const log = (...a) => console.log(new Date().toISOString(), ...a)
 
@@ -61,9 +74,68 @@ function tokenOwner(token) {
     return hit.user
 }
 
+// ---------- OIDC access tokens ----------
+
+// Keys of OIDC_JWKS_URL by kid. Read again for an unknown kid (a rotation),
+// at most once a minute.
+let jwks = new Map()
+let jwksRead = 0
+
+async function signingKey(kid) {
+    if (!jwks.has(kid) && Date.now() - jwksRead > 60_000) {
+        jwksRead = Date.now()
+        try {
+            const res = await fetch(OIDC_JWKS_URL, { signal: AbortSignal.timeout(10_000) })
+            const keys = (await res.json()).keys || []
+            jwks = new Map(
+                keys
+                    .filter((k) => k.kty === "RSA" && (k.use === "sig" || !k.use))
+                    .map((k) => [k.kid, createPublicKey({ key: k, format: "jwk" })]),
+            )
+        } catch (err) {
+            log("jwks read failed", String(err))
+        }
+    }
+    return jwks.get(kid)
+}
+
+const b64json = (part) => JSON.parse(Buffer.from(part, "base64url").toString())
+
+/** The user an access token names, or null when it is not valid for us */
+async function bearerOwner(header) {
+    const m = typeof header === "string" && header.match(/^Bearer ([\w-]+)\.([\w-]+)\.([\w-]+)$/)
+    if (!m || !OIDC_JWKS_URL || OIDC_ISSUERS.length === 0) return null
+    let head
+    let claims
+    try {
+        head = b64json(m[1])
+        claims = b64json(m[2])
+    } catch {
+        return null
+    }
+    if (head.alg !== "RS256") return null
+    const key = await signingKey(head.kid)
+    if (!key || !verify("RSA-SHA256", Buffer.from(`${m[1]}.${m[2]}`), key, Buffer.from(m[3], "base64url"))) {
+        return null
+    }
+    const now = Date.now() / 1000
+    const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud]
+    if (
+        !OIDC_ISSUERS.includes(claims.iss) ||
+        !aud.includes(OIDC_AUDIENCE) ||
+        typeof claims.exp !== "number" ||
+        claims.exp < now - 30 ||
+        (typeof claims.nbf === "number" && claims.nbf > now + 30)
+    ) {
+        return null
+    }
+    const user = claims[OIDC_USER_CLAIM]
+    return typeof user === "string" && user ? user : null
+}
+
 // ---------- tunnels (memory) ----------
 
-/** id -> { user, waiting: [res], queue: [req], pending: Map(id -> res), seen } */
+/** id -> { user, secret, waiting: [res], queue: [req], pending: Map(id -> res), seen } */
 const tunnels = new Map()
 
 function tunnelFor(id, user) {
@@ -127,10 +199,11 @@ const esc = (s) =>
 // ---------- MCP side: /mcp-api/ ----------
 
 async function mcpApi(req, res, path) {
-    const user = tokenOwner(req.headers["x-relay-token"])
-    if (!user) return json(res, 401, { error: "invalid token" })
-
     if (path === "/mcp-api/connect" && req.method === "POST") {
+        const user = (await bearerOwner(req.headers.authorization)) || tokenOwner(req.headers["x-relay-token"])
+        if (!user) {
+            return json(res, 401, { error: "invalid token" })
+        }
         let body = {}
         try {
             body = JSON.parse((await readBody(req, 4096)).toString() || "{}")
@@ -142,15 +215,28 @@ async function mcpApi(req, res, path) {
             const own = [...tunnels.values()].filter((t) => t.user === user).length
             if (!id && own >= MAX_TUNNELS_PER_USER) return json(res, 429, { error: "too many tunnels" })
             id ||= randomBytes(16).toString("hex")
-            tunnels.set(id, { user, waiting: [], queue: [], pending: new Map(), seen: Date.now() })
+            tunnels.set(id, {
+                user,
+                secret: randomBytes(24).toString("hex"),
+                waiting: [],
+                queue: [],
+                pending: new Map(),
+                seen: Date.now(),
+            })
             log("tunnel open", id.slice(0, 8), user)
         }
-        return json(res, 200, { tunnel: id, prefix: `/mcp/t/${id}`, user })
+        const t = tunnels.get(id)
+        t.seen = Date.now()
+        return json(res, 200, { tunnel: id, secret: t.secret, prefix: `/mcp/t/${id}`, user })
     }
 
+    // Polls and replies carry the tunnel's own secret
     const m = path.match(/^\/mcp-api\/t\/([0-9a-f]{32})\/(next|reply)$/)
-    const t = m && tunnelFor(m[1], user)
-    if (!t) return json(res, 404, { error: "unknown tunnel" })
+    const t = m && tunnels.get(m[1])
+    const given = Buffer.from(String(req.headers["x-tunnel-secret"] || ""))
+    if (!t || given.length !== t.secret.length || !timingSafeEqual(given, Buffer.from(t.secret))) {
+        return json(res, 404, { error: "unknown tunnel" })
+    }
     t.seen = Date.now()
 
     if (m[2] === "next" && req.method === "GET") {
