@@ -140,8 +140,36 @@ export function previewUrl(
     sessionId: string,
     ui: PreviewUi = PREVIEW_UI,
 ): string {
+    // Through the relay only the shell: the classic page's paths are fixed
+    if (relay && activePreviewUi(ui) === "shell") {
+        return `${relay.origin}${relay.prefix}/shell/?mcp=${sessionId}`
+    }
     const path = activePreviewUi(ui) === "shell" ? "/shell/" : ""
     return `http://localhost:${port}${path}?mcp=${sessionId}`
+}
+
+/**
+ * The relay tunnel (relay-tunnel.ts), once open: start_session then hands
+ * out the relay's address, and the shell it serves embeds the relay host's
+ * own draw.io (RELAY_DRAWIO_URL, default "/"), on the shell's origin.
+ */
+let relay: { origin: string; readonly prefix: string } | null = null
+
+export function setRelay(
+    tunnel: { origin: string; readonly prefix: string } | null,
+): void {
+    relay = tunnel
+}
+
+const RELAY_DRAWIO_URL = process.env.RELAY_DRAWIO_URL || "/"
+
+// The tunnel names the prefix the tab sees in this header. Only the tunnel
+// can send it: the server serves localhost only.
+function relayBaseOf(req: http.IncomingMessage): string {
+    const base = req.headers["x-relay-base"]
+    return typeof base === "string" && /^\/mcp\/t\/[0-9a-f]{32}$/.test(base)
+        ? base
+        : ""
 }
 
 /**
@@ -165,7 +193,7 @@ function readDrawioVersion(dir: string | null): string {
  * or when the bundled copy is missing.
  */
 export function isSameOriginDrawio(): boolean {
-    return !EXTERNAL_DRAWIO && drawioDir !== null
+    return relay !== null || (!EXTERNAL_DRAWIO && drawioDir !== null)
 }
 
 // Extract origin (scheme + host + port) from URL for postMessage security check
@@ -708,7 +736,9 @@ function routeRequest(
     if (url.pathname.startsWith("/shell/")) {
         const rest = url.pathname.slice("/shell/".length)
         if (rest === "" || rest === "index.html") {
-            servePage(req, res, url, "/shell/", getShellPage)
+            servePage(req, res, url, "/shell/", (sessionId) =>
+                getShellPage(sessionId, relayBaseOf(req)),
+            )
         } else {
             serveStaticFile(req, res, shellDir, rest, PACKAGE_VERSION)
         }
@@ -1337,13 +1367,14 @@ export function drawioEmbedParams(
 export function shellConfig(
     sessionId: string,
     env: NodeJS.ProcessEnv = process.env,
+    relayBase = "",
 ): Record<string, string> {
     const settings = hostDrawioSettings(env)
     return {
         sessionId,
         token: API_TOKEN,
-        apiBase: "/api",
-        drawioBaseUrl: drawioEditorUrl(),
+        apiBase: `${relayBase}/api`,
+        drawioBaseUrl: relayBase ? RELAY_DRAWIO_URL : drawioEditorUrl(),
         drawioUi: settings.ui,
         drawioLang: settings.lang,
         drawioDark: settings.dark,
@@ -1351,13 +1382,16 @@ export function shellConfig(
     }
 }
 
-/** The shell page, or null when the shell is not built */
-function getShellPage(sessionId: string): string | null {
+/** The shell page, or null when the shell is not built. relayBase: the
+ * prefix the tab reached it under through the relay */
+function getShellPage(sessionId: string, relayBase = ""): string | null {
     if (!shellDir) return null
     const template = readFileSync(join(shellDir, "index.html"), "utf8")
-    return template.replace("{{CONFIG_JSON}}", () =>
-        scriptJson(shellConfig(sessionId)),
-    )
+    return template
+        .replaceAll('"/shell/', () => `"${relayBase}/shell/`)
+        .replace("{{CONFIG_JSON}}", () =>
+            scriptJson(shellConfig(sessionId, process.env, relayBase)),
+        )
 }
 
 function getHtmlPage(sessionId: string): string {

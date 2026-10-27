@@ -81,6 +81,7 @@ import {
     restoreSavedSession,
     setSessionFile,
     setState,
+    setRelay,
     shutdown,
     startHttpServer,
     waitForSync,
@@ -88,6 +89,7 @@ import {
 import { parseDrawioFileContent } from "./load-diagram.ts"
 import { log } from "./logger.ts"
 import { prepareNewDiagram, prepareNewModel } from "./new-diagram.ts"
+import { relayConfigFromEnv, startRelayTunnel } from "./relay-tunnel.ts"
 import {
     addPageToDoc,
     BLANK_MXFILE,
@@ -469,6 +471,7 @@ registerTool(
     async ({ session_id }) => {
         // Start embedded HTTP server
         const port = await startHttpServer(config.port)
+        await openRelay(port)
 
         // Create session, or continue a saved one under its old id
         const sessionId =
@@ -520,6 +523,23 @@ registerTool(
     },
     { write: true },
 )
+
+// The relay tunnel, opened with the first session when RELAY_URL is set
+let relayOpening: Promise<void> | null = null
+
+function openRelay(port: number): Promise<void> {
+    const relayConfig = relayConfigFromEnv()
+    if (!relayConfig) return Promise.resolve()
+    relayOpening ??= startRelayTunnel(relayConfig.url, relayConfig.token, port)
+        .then((tunnel) => setRelay(tunnel))
+        .catch((err) => {
+            // The next start_session tries again; until then the preview
+            // stays local
+            relayOpening = null
+            log.error("Could not open the relay tunnel:", err)
+        })
+    return relayOpening
+}
 
 /** "2026-10-04 09:30" in the server's local time */
 function formatLocalTime(date: Date): string {
