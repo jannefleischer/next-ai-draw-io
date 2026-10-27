@@ -11,7 +11,8 @@
 // the tab's requests through the tunnel (packages/mcp-server/src/relay-tunnel.ts).
 //
 // Env: PORT (8080), DATA_DIR (/data), PUBLIC_URL (for the Origin check of
-// the token page), USER_HEADER (x-forwarded-email).
+// the token page), USER_HEADERS (x-forwarded-email,x-forwarded-user: the
+// first one present names the user; local accounts of the proxy have no email).
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
@@ -21,7 +22,11 @@ import { join } from "node:path"
 const PORT = Number(process.env.PORT || 8080)
 const DATA_DIR = process.env.DATA_DIR || "/data"
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, "")
-const USER_HEADER = (process.env.USER_HEADER || "x-forwarded-email").toLowerCase()
+const USER_HEADERS = (process.env.USER_HEADERS || "x-forwarded-email,x-forwarded-user")
+    .toLowerCase()
+    .split(",")
+    .map((h) => h.trim())
+    .filter(Boolean)
 const MAX_BODY = 12 * 1024 * 1024 // the MCP server takes 10 MiB, base64 adds a third
 const POLL_WAIT_MS = 25_000
 const REPLY_WAIT_MS = 60_000
@@ -318,8 +323,8 @@ const server = http.createServer(async (req, res) => {
         if (path.startsWith("/mcp-api/")) return await mcpApi(req, res, path)
 
         // Everything else needs the proxy's identity
-        const user = req.headers[USER_HEADER]
-        if (typeof user !== "string" || !user) return send(res, 401, "Not signed in")
+        const user = USER_HEADERS.map((h) => req.headers[h]).find((v) => typeof v === "string" && v)
+        if (!user) return send(res, 401, "Not signed in")
 
         const m = path.match(/^\/mcp\/t\/([0-9a-f]{32})(\/.*)?$/)
         if (m) return await tabRequest(req, res, user, m[1], m[2] || "/", url.search)
