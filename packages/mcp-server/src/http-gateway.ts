@@ -86,36 +86,41 @@ async function signingKey(kid: string): Promise<KeyObject | undefined> {
 
 const b64json = (part: string) => JSON.parse(Buffer.from(part, "base64url").toString())
 
-/** The user a valid access token names, or null */
+/** The user a valid access token names, or null (the reason is logged) */
 export async function tokenUser(token: string): Promise<string | null> {
+    const why = await tokenProblem(token)
+    if (typeof why === "string") {
+        log.warn(`Token refused: ${why}`)
+        return null
+    }
+    return why.user
+}
+
+async function tokenProblem(token: string): Promise<string | { user: string }> {
     const m = token.match(/^([\w-]+)\.([\w-]+)\.([\w-]+)$/)
-    if (!m || !ISSUER) return null
+    if (!m) return "not a JWT"
     let head: { alg?: string; kid?: string }
     let claims: Record<string, unknown>
     try {
         head = b64json(m[1])
         claims = b64json(m[2])
     } catch {
-        return null
+        return "not a JWT"
     }
-    if (head.alg !== "RS256" || typeof head.kid !== "string") return null
+    if (head.alg !== "RS256" || typeof head.kid !== "string") return `alg ${head.alg}`
     const key = await signingKey(head.kid)
-    if (!key || !verify("RSA-SHA256", Buffer.from(`${m[1]}.${m[2]}`), key, Buffer.from(m[3], "base64url"))) {
-        return null
+    if (!key) return `unknown key ${head.kid}`
+    if (!verify("RSA-SHA256", Buffer.from(`${m[1]}.${m[2]}`), key, Buffer.from(m[3], "base64url"))) {
+        return "bad signature"
     }
     const now = Date.now() / 1000
     const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud]
-    if (
-        claims.iss !== ISSUER ||
-        !aud.includes(AUDIENCE) ||
-        typeof claims.exp !== "number" ||
-        claims.exp < now - 30 ||
-        (typeof claims.nbf === "number" && claims.nbf > now + 30)
-    ) {
-        return null
-    }
+    if (claims.iss !== ISSUER) return `issuer ${String(claims.iss)}`
+    if (!aud.includes(AUDIENCE)) return `audience ${JSON.stringify(claims.aud)} (azp ${String(claims.azp)}) lacks ${AUDIENCE}`
+    if (typeof claims.exp !== "number" || claims.exp < now - 30) return "expired"
+    if (typeof claims.nbf === "number" && claims.nbf > now + 30) return "not yet valid"
     const user = claims[USER_CLAIM]
-    return typeof user === "string" && user ? user : null
+    return typeof user === "string" && user ? { user } : `no ${USER_CLAIM} claim`
 }
 
 /** RFC 8693: the user's token for the relay; null when the exchange fails */
@@ -263,6 +268,7 @@ function unauthorized(res: http.ServerResponse, error?: string) {
 async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse) {
     const auth = req.headers.authorization ?? ""
     const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : ""
+    if (!token) log.info(`Request without token from ${req.socket.remoteAddress}`)
     const user = token ? await tokenUser(token) : null
     if (!user) return unauthorized(res, token ? "invalid_token" : undefined)
 
