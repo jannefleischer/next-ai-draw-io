@@ -123,8 +123,10 @@ async function tokenProblem(token: string): Promise<string | { user: string }> {
     return typeof user === "string" && user ? { user } : `no ${USER_CLAIM} claim`
 }
 
-/** RFC 8693: the user's token for the relay; null when the exchange fails */
-async function exchangeForRelay(subjectToken: string): Promise<{ token: string; exp: number } | null> {
+/** RFC 8693: the user's token for the relay, or why the exchange failed */
+async function exchangeForRelay(
+    subjectToken: string,
+): Promise<{ token: string; exp: number } | { error: string }> {
     const body = new URLSearchParams({
         grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
         subject_token: subjectToken,
@@ -141,16 +143,21 @@ async function exchangeForRelay(subjectToken: string): Promise<{ token: string; 
             body,
             signal: AbortSignal.timeout(10_000),
         })
-        if (!res.ok) {
-            log.warn(`Token exchange refused: ${res.status} ${(await res.text()).slice(0, 200)}`)
-            return null
+        const data = (await res.json().catch(() => ({}))) as {
+            access_token?: string
+            expires_in?: number
+            error?: string
+            error_description?: string
         }
-        const data = (await res.json()) as { access_token?: string; expires_in?: number }
-        if (!data.access_token) return null
+        if (!res.ok || !data.access_token) {
+            const error = `${res.status} ${data.error ?? ""}: ${data.error_description ?? ""}`.trim()
+            log.warn(`Token exchange refused: ${error}`)
+            return { error }
+        }
         return { token: data.access_token, exp: Date.now() + (data.expires_in ?? 60) * 1000 }
     } catch (err) {
         log.warn(`Token exchange failed: ${String(err)}`)
-        return null
+        return { error: String(err) }
     }
 }
 
@@ -291,7 +298,21 @@ async function handleMcp(req: http.IncomingMessage, res: http.ServerResponse) {
         // A fresh relay token before a tool may open or reopen the tunnel
         if (RELAY_URL && worker.relayTokenExp - Date.now() < 60_000) {
             const relay = await exchangeForRelay(token)
-            if (relay) {
+            if ("error" in relay) {
+                // Without it the user's process cannot reach the relay: say
+                // so rather than start a session nobody can open
+                if (request.params.name === "start_session" || worker.relayTokenExp < Date.now()) {
+                    return {
+                        isError: true,
+                        content: [
+                            {
+                                type: "text" as const,
+                                text: `Error: the draw.io relay cannot be reached for this user: the token exchange with ${ISSUER} failed (${relay.error}). Tell the user; an administrator has to fix the Keycloak setup of the MCP client.`,
+                            },
+                        ],
+                    }
+                }
+            } else {
                 writeFileSync(join(worker.dir, "relay-token"), relay.token, { mode: 0o600 })
                 worker.relayTokenExp = relay.exp
             }

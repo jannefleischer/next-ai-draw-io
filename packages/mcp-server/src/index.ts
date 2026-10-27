@@ -471,7 +471,12 @@ registerTool(
     async ({ session_id }) => {
         // Start embedded HTTP server
         const port = await startHttpServer(config.port)
-        await openRelay(port)
+        const relayError = await openRelay(port)
+        if (relayError) {
+            return fail(
+                `The live preview is not available: the connection to the draw.io relay (${process.env.RELAY_URL}) failed (${relayError}). No session was started. Tell the user, and ask an administrator to check the relay access if this persists.`,
+            )
+        }
 
         // Create session, or continue a saved one under its old id
         const sessionId =
@@ -525,18 +530,26 @@ registerTool(
 )
 
 // The relay tunnel, opened with the first session when RELAY_URL is set
-let relayOpening: Promise<void> | null = null
+let relayOpening: Promise<string | null> | null = null
 
-function openRelay(port: number): Promise<void> {
+/**
+ * Opens the tunnel when RELAY_URL is set. Resolves to null, or to why it
+ * failed: a preview on localhost would be no use to whoever asked for the
+ * relay, so start_session reports that instead of a local URL.
+ */
+function openRelay(port: number): Promise<string | null> {
     const relayConfig = relayConfigFromEnv()
-    if (!relayConfig) return Promise.resolve()
+    if (!relayConfig) return Promise.resolve(null)
     relayOpening ??= startRelayTunnel(relayConfig.url, relayConfig.token, port)
-        .then((tunnel) => setRelay(tunnel))
+        .then((tunnel) => {
+            setRelay(tunnel)
+            return null
+        })
         .catch((err) => {
-            // The next start_session tries again; until then the preview
-            // stays local
+            // The next start_session tries again
             relayOpening = null
             log.error("Could not open the relay tunnel:", err)
+            return err instanceof Error ? err.message : String(err)
         })
     return relayOpening
 }
